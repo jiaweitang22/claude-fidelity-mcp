@@ -11,9 +11,14 @@ async function openTicket(): Promise<Page> {
   return openPage(TRADE_URL);
 }
 
-async function selectAccount(page: Page, accountNumber: string): Promise<boolean> {
-  await page.locator("#dest-acct-dropdown").click({ timeout: 10000 });
-  const options = page.locator("button[role='option']");
+// Opens a ticket's account dropdown and picks the exact account number.
+async function selectAccount(
+  page: Page,
+  dropdown: Locator,
+  options: Locator,
+  accountNumber: string
+): Promise<boolean> {
+  await dropdown.click({ timeout: 10000 });
   await options.first().waitFor({ state: "visible", timeout: 5000 });
   const match = await findAccountOption(await options.all(), accountNumber);
   if (!match) return false;
@@ -138,16 +143,54 @@ export function readPreview(pageText: string) {
   };
 }
 
+type Preview = NonNullable<ReturnType<typeof readPreview>>;
+
+// Returns how the preview differs from the request, or null when it matches.
+// Fail closed: an unreadable preview counts as a mismatch.
+export function previewMismatch(preview: Preview | null, order: OrderRequest | FundOrder): string | null {
+  if (!preview) return "could not read the order preview";
+  if (!preview.account?.includes(`(${order.accountNumber})`)) return `preview account is ${preview.account}`;
+  if (preview.symbol?.toUpperCase() !== order.symbol.toUpperCase()) return `preview symbol is ${preview.symbol}`;
+  if (preview.action?.toLowerCase() !== order.action) return `preview action is ${preview.action}`;
+  if ("amount" in order) {
+    const shown = parseFloat((preview.amount ?? "").replace(/[$,]/g, ""));
+    if (shown !== parseFloat(order.amount.toFixed(2))) return `preview amount is ${preview.amount}`;
+  } else if (parseFloat(preview.quantity ?? "") !== order.quantity) {
+    return `preview quantity is ${preview.quantity}`;
+  }
+  return null;
+}
+
+type Failed = { ok: false; result: OrderResult };
 type Filled =
-  | { ok: false; result: OrderResult }
+  | Failed
   | { ok: true; summary: string; orderDetails: NonNullable<OrderResult["orderDetails"]>; placeButton: Locator };
 
-// Fills the trade ticket on `page`, clicks Preview, and checks the preview
-// against the request. Stops on the preview screen; never places.
+function fail(message: string): Failed {
+  return { ok: false, result: { success: false, message } };
+}
+
+// Clicks Preview on a filled ticket and checks the preview against the
+// request. Stops on the preview screen; never places.
+async function previewAndVerify(
+  page: Page,
+  order: OrderRequest | FundOrder
+): Promise<Failed | { ok: true; estimatedValue?: string; placeButton: Locator }> {
+  await page.getByRole("button", { name: "Preview order" }).click();
+  await waitForLoading(page);
+  const placeButton = page.getByRole("button", { name: "Place order" });
+  if (!(await appears(placeButton, 15000))) return fail(await previewError(page));
+
+  const preview = readPreview(await page.locator("body").innerText());
+  const mismatch = previewMismatch(preview, order);
+  if (mismatch) return fail(`Aborted: ${mismatch}.`);
+  return { ok: true, estimatedValue: preview!.estimatedValue, placeButton };
+}
+
+// Fills the trade ticket on `page` and previews it (see previewAndVerify).
 async function fillAndPreview(page: Page, order: OrderRequest): Promise<Filled> {
-  const fail = (message: string): Filled => ({ ok: false, result: { success: false, message } });
   const symbol = order.symbol.toUpperCase();
-  if (!(await selectAccount(page, order.accountNumber))) {
+  if (!(await selectAccount(page, page.locator("#dest-acct-dropdown"), page.locator("button[role='option']"), order.accountNumber))) {
     return fail(`Account ${order.accountNumber} not found on the trade ticket.`);
   }
   await enterSymbol(page, symbol);
@@ -182,31 +225,11 @@ async function fillAndPreview(page: Page, order: OrderRequest): Promise<Filled> 
     await page.getByRole("option", { name: "Market", exact: true }).click({ timeout: 3000 });
   }
 
-  await page.getByRole("button", { name: "Preview order" }).click();
-  await waitForLoading(page);
-  const placeButton = page.getByRole("button", { name: "Place order" });
-  if (!(await appears(placeButton, 15000))) {
-    return fail(await previewError(page));
-  }
-
-  // Fail closed: if the preview can't be read or doesn't match the request,
-  // don't report success and never place.
-  const preview = readPreview(await page.locator("body").innerText());
-  const mismatch = !preview
-    ? "could not read the order preview"
-    : !preview.account?.includes(`(${order.accountNumber})`)
-      ? `preview account is ${preview.account}`
-      : preview.symbol?.toUpperCase() !== symbol
-        ? `preview symbol is ${preview.symbol}`
-        : preview.action?.toLowerCase() !== order.action
-          ? `preview action is ${preview.action}`
-          : parseFloat(preview.quantity ?? "") !== order.quantity
-            ? `preview quantity is ${preview.quantity}`
-            : null;
-  if (mismatch) return fail(`Aborted: ${mismatch}.`);
+  const verified = await previewAndVerify(page, order);
+  if (!verified.ok) return verified;
 
   const orderDetails = {
-    estimatedValue: preview!.estimatedValue,
+    estimatedValue: verified.estimatedValue,
     account: order.accountNumber,
     symbol,
     action: order.action,
@@ -219,7 +242,7 @@ async function fillAndPreview(page: Page, order: OrderRequest): Promise<Filled> 
   const summary = `${order.action.toUpperCase()} ${order.quantity} ${symbol} @ ${
     resolved.orderType === "limit" ? `$${resolved.limitPrice!.toFixed(resolved.precision)} limit` : "market"
   } in ${order.accountNumber}`;
-  return { ok: true, summary, orderDetails, placeButton };
+  return { ok: true, summary, orderDetails, placeButton: verified.placeButton };
 }
 
 export async function placeOrder(order: OrderRequest): Promise<OrderResult> {
@@ -242,11 +265,9 @@ export async function placeOrder(order: OrderRequest): Promise<OrderResult> {
     : { success: false, message: "Order may not have been confirmed. Check Fidelity directly before retrying." };
 }
 
-// Fills and previews the order in a visible Fidelity window and leaves it on
-// the preview screen for the user to click "Place order" (or Cancel) themselves.
-export async function stageOrder(order: OrderRequest): Promise<OrderResult> {
-  const page = await openVisiblePage(TRADE_URL);
-  const filled = await fillAndPreview(page, order);
+// Leaves a verified preview in the visible window for the user to click
+// "Place order" (or Cancel) themselves.
+async function leaveStaged(page: Page, filled: Filled): Promise<OrderResult> {
   if (!filled.ok) return filled.result;
   await page.bringToFront();
   await filled.placeButton.scrollIntoViewIfNeeded();
@@ -255,6 +276,12 @@ export async function stageOrder(order: OrderRequest): Promise<OrderResult> {
     message: `Staged, not placed: ${filled.summary}. The preview is open in the Fidelity window ("Nightly"); the user reviews it and clicks Place order or Cancel there.`,
     orderDetails: filled.orderDetails,
   };
+}
+
+// Fills and previews the order in a visible Fidelity window and stops there.
+export async function stageOrder(order: OrderRequest): Promise<OrderResult> {
+  const page = await openVisiblePage(TRADE_URL);
+  return leaveStaged(page, await fillAndPreview(page, order));
 }
 
 const MF_TRADE_URL =
@@ -272,20 +299,15 @@ export interface FundOrder {
   amount: number; // dollars
 }
 
-// Fills the mutual-fund ticket (bought and sold by dollar amount), clicks
-// Preview, and checks the preview against the request. Stops on the preview.
+// Fills the mutual-fund ticket (bought and sold by dollar amount) and previews
+// it (see previewAndVerify).
 async function fillFundAndPreview(page: Page, order: FundOrder): Promise<Filled> {
-  const fail = (message: string): Filled => ({ ok: false, result: { success: false, message } });
   const symbol = order.symbol.toUpperCase();
   const dropdown = (label: string) => page.locator("#mf-dropdownlist-button").filter({ hasText: label });
 
-  await dropdown("Account").click({ timeout: 10000 });
-  const options = page.locator("[role='option']");
-  await options.first().waitFor({ state: "visible", timeout: 5000 });
-  const match = await findAccountOption(await options.all(), order.accountNumber);
-  if (!match) return fail(`Account ${order.accountNumber} not found on the mutual fund ticket.`);
-  await match.option.click();
-  await page.waitForTimeout(2000);
+  if (!(await selectAccount(page, dropdown("Account"), page.locator("[role='option']"), order.accountNumber))) {
+    return fail(`Account ${order.accountNumber} not found on the mutual fund ticket.`);
+  }
 
   const input = page.locator("#mf-ticket-dest-symbol-Symbol");
   await input.fill(symbol);
@@ -300,32 +322,16 @@ async function fillFundAndPreview(page: Page, order: FundOrder): Promise<Filled>
   await amount.fill(order.amount.toFixed(2));
   await amount.press("Tab");
 
-  await page.getByRole("button", { name: "Preview order" }).click();
-  await waitForLoading(page);
-  const placeButton = page.getByRole("button", { name: "Place order" });
-  if (!(await appears(placeButton, 15000))) return fail(await previewError(page));
-
-  const preview = readPreview(await page.locator("body").innerText());
-  const mismatch = !preview
-    ? "could not read the order preview"
-    : !preview.account?.includes(`(${order.accountNumber})`)
-      ? `preview account is ${preview.account}`
-      : preview.symbol?.toUpperCase() !== symbol
-        ? `preview symbol is ${preview.symbol}`
-        : preview.action?.toLowerCase() !== order.action
-          ? `preview action is ${preview.action}`
-          : parseFloat((preview.amount ?? "").replace(/[$,]/g, "")) !== parseFloat(order.amount.toFixed(2))
-            ? `preview amount is ${preview.amount}`
-            : null;
-  if (mismatch) return fail(`Aborted: ${mismatch}.`);
+  const verified = await previewAndVerify(page, order);
+  if (!verified.ok) return verified;
 
   const summary = `${order.action.toUpperCase()} $${order.amount.toFixed(2)} of ${symbol} at the next NAV in ${order.accountNumber}`;
   return {
     ok: true,
     summary,
-    placeButton,
+    placeButton: verified.placeButton,
     orderDetails: {
-      estimatedValue: preview!.estimatedValue,
+      estimatedValue: verified.estimatedValue,
       account: order.accountNumber,
       symbol,
       action: order.action,
@@ -339,15 +345,7 @@ async function fillFundAndPreview(page: Page, order: FundOrder): Promise<Filled>
 // Same as stageOrder, for a mutual fund bought or sold by dollar amount.
 export async function stageFundOrder(order: FundOrder): Promise<OrderResult> {
   const page = await openVisiblePage(MF_TRADE_URL);
-  const filled = await fillFundAndPreview(page, order);
-  if (!filled.ok) return filled.result;
-  await page.bringToFront();
-  await filled.placeButton.scrollIntoViewIfNeeded();
-  return {
-    success: true,
-    message: `Staged, not placed: ${filled.summary}. The preview is open in the Fidelity window ("Nightly"); the user reviews it and clicks Place order or Cancel there.`,
-    orderDetails: filled.orderDetails,
-  };
+  return leaveStaged(page, await fillFundAndPreview(page, order));
 }
 
 export interface BatchOrder {

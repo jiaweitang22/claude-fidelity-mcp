@@ -244,12 +244,13 @@ export function status() {
   const active = page !== null && !page.isClosed();
   const url = active ? page!.url() : null;
   const onLoginPage = url !== null && isOnLoginPage(url);
-  const message = !active
-    ? savedAt
-      ? "Browser not started. Tools start it from the saved session on first use."
-      : "No saved session. Call fidelity_login or run `npm run login`."
-    : onLoginPage
-      ? "Browser is on the sign-in page: the session expired. Call fidelity_login."
-      : "Browser session is active.";
+  const message = statusMessage(active, savedAt !== null, onLoginPage);
   return { browserActive: active, currentUrl: url, onLoginPage, sessionFile: config.sessionFile, savedAt, message };
+}
+
+function statusMessage(active: boolean, hasSavedSession: boolean, onLoginPage: boolean): string {
+  if (active && onLoginPage) return "Browser is on the sign-in page: the session expired. Call fidelity_login.";
+  if (active) return "Browser session is active.";
+  if (hasSavedSession) return "Browser not started. Tools start it from the saved session on first use.";
+  return "No saved session. Call fidelity_login or run `npm run login`.";
 }

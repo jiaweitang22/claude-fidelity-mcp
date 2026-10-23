@@ -52,7 +52,7 @@ Flows get a page only through `openPage(url)`. It throws `SessionExpiredError` o
 - URL checks use the pathname (`isOnLoginPage`): sign-in redirects carry the destination in `?AuthRedUrl=…portfolio%2Fsummary`.
 - Fidelity's Akamai cookies (`_abck`, `bm_*`) are fingerprint-bound. The login window and the server browser share `launch()` in `session.ts` (args, user agent, init script); keep them identical.
 - Accounts match by exact account number via `findAccountOption()`; one account number can be a substring of another.
-- `readPreview()` parses the "Preview Order" block as text; the account, symbol, action and quantity must match the request or the order aborts (fail closed).
+- `readPreview()` parses the "Preview Order" block as text; `previewMismatch()` checks its account, symbol, action and quantity (or dollar amount for funds) against the request, and any difference aborts the order (fail closed).
 
 ## Site map (verified 2026-10-23)
 
@@ -63,6 +63,6 @@ Flows get a page only through `openPage(url)`. It throws `SessionExpiredError` o
 
 ## Changing the code
 
-- `npm run build` must pass, and the server must answer `tools/list` over stdio. There is no test suite; `parsePositionsCsv`, `parseAccountText`, `readPreview` and `resolveOrderType` are pure and the place to start one.
+- `npm run build` must pass, and the server must answer `tools/list` over stdio. There is no test suite; `parsePositionsCsv`, `parseAccountText`, `readPreview`, `previewMismatch` and `resolveOrderType` are pure and the place to start one.
 - When Fidelity ships UI changes, selectors break. Look before guessing: `fidelity_page_content` / `fidelity_screenshot` with the page URL, or a scratch script importing `dist/session.js` (`openPage`, `closeSession`). Prefer ids and `exact: true` role/label matches.
 - Live testing is read-only: accounts, positions, quotes, and dry-run order previews. Orders with `dry_run: false` and transfers are never part of testing.
