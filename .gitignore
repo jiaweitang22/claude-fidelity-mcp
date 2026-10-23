@@ -1,0 +1,11 @@
+node_modules/
+dist/
+*.tsbuildinfo
+.env
+
+# Session files
+.fidelity-mcp/
+fidelity_session_*.json
+
+# Browser/auth data (host stdio mode)
+data/
