@@ -247,10 +247,14 @@ async function fillAndPreview(page: Page, order: OrderRequest): Promise<Filled> 
 
 export async function placeOrder(order: OrderRequest): Promise<OrderResult> {
   const page = await openTicket();
-  const filled = await fillAndPreview(page, order);
+  return placeAfterPreview(page, await fillAndPreview(page, order), order.dryRun);
+}
+
+// Clicks "Place order" on a verified preview, unless this is a dry run.
+async function placeAfterPreview(page: Page, filled: Filled, dryRun: boolean | undefined): Promise<OrderResult> {
   if (!filled.ok) return filled.result;
   const { summary, orderDetails, placeButton } = filled;
-  if (order.dryRun !== false) {
+  if (dryRun !== false) {
     return { success: true, message: `Dry run: previewed, not placed. ${summary}.`, orderDetails };
   }
 
@@ -297,6 +301,31 @@ export interface FundOrder {
   symbol: string;
   action: OrderAction;
   amount: number; // dollars
+  dryRun?: boolean;
+}
+
+export type OrderInput = Omit<OrderRequest, "quantity" | "dryRun"> & { quantity?: number; amount?: number };
+
+// Mutual funds trade by dollar amount at the next NAV; stocks/ETFs by whole
+// shares. Fields that don't apply are rejected, not ignored: a dropped limit
+// price would fill a fund at NAV when the user meant a limit.
+export function routeOrder(
+  input: OrderInput
+): { kind: "stock"; order: OrderRequest } | { kind: "fund"; order: FundOrder } | { kind: "error"; message: string } {
+  const { quantity, amount, orderType, limitPrice, ...base } = input;
+  const error = (message: string) => ({ kind: "error" as const, message });
+  if (quantity !== undefined && amount !== undefined) {
+    return error("Pass quantity (shares) or amount (dollars), not both.");
+  }
+  if (isMutualFund(base.symbol)) {
+    if (amount === undefined) return error(`${base.symbol} is a mutual fund: pass amount (dollars), not quantity.`);
+    if (orderType === "limit" || limitPrice !== undefined) {
+      return error(`${base.symbol} is a mutual fund: it fills at the next NAV, so limit orders don't apply.`);
+    }
+    return { kind: "fund", order: { ...base, amount } };
+  }
+  if (quantity === undefined) return error(`${base.symbol} trades in shares: pass quantity.`);
+  return { kind: "stock", order: { ...base, quantity, orderType, limitPrice } };
 }
 
 // Fills the mutual-fund ticket (bought and sold by dollar amount) and previews
@@ -348,6 +377,12 @@ export async function stageFundOrder(order: FundOrder): Promise<OrderResult> {
   return leaveStaged(page, await fillFundAndPreview(page, order));
 }
 
+// Same as placeOrder, for a mutual fund bought or sold by dollar amount.
+export async function placeFundOrder(order: FundOrder): Promise<OrderResult> {
+  const page = await openPage(MF_TRADE_URL);
+  return placeAfterPreview(page, await fillFundAndPreview(page, order), order.dryRun);
+}
+
 export interface BatchOrder {
   symbol: string;
   quantity: number;
@@ -357,6 +392,11 @@ export interface BatchOrder {
 export async function placeBatchOrders(accountNumber: string, orders: BatchOrder[], dryRun: boolean) {
   const results: { symbol: string; quantity: number; success: boolean; message: string }[] = [];
   for (const o of orders) {
+    if (isMutualFund(o.symbol)) {
+      const message = `${o.symbol} is a mutual fund: place it with fidelity_place_order and a dollar amount.`;
+      results.push({ symbol: o.symbol, quantity: o.quantity, success: false, message });
+      continue;
+    }
     const r = await placeOrder({ accountNumber, ...o, dryRun }).catch(
       (e): OrderResult => ({ success: false, message: e instanceof Error ? e.message : String(e) })
     );

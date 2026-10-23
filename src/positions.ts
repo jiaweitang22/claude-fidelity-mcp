@@ -7,6 +7,10 @@ import type { Account } from "./types.js";
 const POSITIONS_URL = "https://digital.fidelity.com/ftgw/digital/portfolio/positions";
 const CASH_TICKERS = new Set(["SPAXX", "FCASH", "FDRXX", "FZFXX", "CORE"]);
 
+export function isCashTicker(symbol: string): boolean {
+  return CASH_TICKERS.has(symbol.toUpperCase());
+}
+
 // Positions come from the page's "Available Actions → Download" CSV, the
 // format Fidelity keeps stable across UI redesigns.
 export async function getPositions(): Promise<Account[]> {
@@ -26,8 +30,13 @@ async function downloadCsv(page: Page): Promise<string> {
 }
 
 function toNumber(s: string | undefined): number {
+  return toOptionalNumber(s) ?? 0;
+}
+
+// For columns where "no figure" (blank, "--", "n/a") must not read as 0.
+function toOptionalNumber(s: string | undefined): number | undefined {
   const n = parseFloat((s ?? "").replace(/[$,%+]/g, "").trim());
-  return isNaN(n) ? 0 : n;
+  return isNaN(n) ? undefined : n;
 }
 
 // Builds accounts from the positions CSV. Column names are matched
@@ -69,6 +78,11 @@ export function parsePositionsCsv(csv: string): Account[] {
       lastPrice: toNumber(r["last price"]),
       lastPriceChange: toNumber(r["last price change"]),
       currentValue,
+      isCash,
+      costBasis: toOptionalNumber(r["cost basis total"]),
+      averageCost: toOptionalNumber(r["average cost basis"]),
+      totalGainLoss: toOptionalNumber(r["total gain/loss dollar"]),
+      totalGainLossPercent: toOptionalNumber(r["total gain/loss percent"]),
     });
   }
   return [...accounts.values()];

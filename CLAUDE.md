@@ -4,7 +4,7 @@ MCP server that drives Fidelity's website with Playwright (Firefox). There is no
 
 ## Hard rules
 
-- **Real money moves only on explicit user confirmation** of the exact account, symbol, side, quantity and limit price (or transfer from/to/amount). Run `fidelity_place_order` / `fidelity_batch_orders` with the default `dry_run: true` first, show the user the returned `orderDetails`, and set `dry_run: false` only after they approve that exact order. When the user wants to place it themselves, use `fidelity_stage_order`: it leaves the previewed order in a visible window and the user clicks Place order. `fidelity_transfer` has no dry run: it submits immediately.
+- **Real money moves only on explicit user confirmation** of the exact account, symbol, side, quantity and limit price (or dollar amount for a mutual fund; or transfer from/to/amount). Run `fidelity_place_order` / `fidelity_batch_orders` with the default `dry_run: true` first, show the user the returned `orderDetails`, and set `dry_run: false` only after they approve that exact order. When the user wants to place it themselves, use `fidelity_stage_order`: it leaves the previewed order in a visible window and the user clicks Place order. `fidelity_transfer` also defaults to `dry_run: true` (stops on Fidelity's review step and returns its text in `review`); show the user that review before setting `dry_run: false`. `fidelity_rebalance_plan` only plans: its orders go through the same dry-run-then-confirm steps.
 - **The user types their own credentials.** Login is always the user in a visible browser window (`fidelity_login` or `npm run login`). Credentials and TOTP secrets never go into config, scripts, commits or chat.
 - **One login attempt, then report.** Repeated attempts trigger Fidelity's "Something went wrong" 2FA page and risk a lockout.
 - **The session file holds live auth cookies** (`~/.fidelity-mcp/fidelity_session_*.json`). Check its mtime/size only; leave its contents unread.
@@ -24,11 +24,12 @@ MCP server that drives Fidelity's website with Playwright (Firefox). There is no
 | `fidelity_login` | Visible window, user logs in; blocks other tools while waiting |
 | `fidelity_logout` | Closes the browser; saved session stays |
 | `fidelity_get_accounts` | Numbers and nicknames from the transfer page; no balances |
-| `fidelity_get_positions` | Positions CSV download; per-account cash in `balance` |
+| `fidelity_get_positions` | Positions CSV download; per-account cash in `balance`; per-position `isCash`, and `costBasis`, `averageCost`, `totalGainLoss(Percent)` when Fidelity shows a figure (absent otherwise, never 0) |
 | `fidelity_get_quote` | Via the trade ticket |
-| `fidelity_place_order` / `fidelity_batch_orders` | `dry_run` defaults to true; result includes `estimatedValue` and `limitPrice` read from Fidelity's preview |
+| `fidelity_place_order` / `fidelity_batch_orders` | `dry_run` defaults to true; result includes `estimatedValue` and `limitPrice` read from Fidelity's preview. `place_order` takes stocks/ETFs by `quantity` and mutual funds by dollar `amount` (`routeOrder`, shared with `stage_order`, rejects fields that don't apply); `batch_orders` is stocks/ETFs only and doesn't wait for fills |
 | `fidelity_stage_order` | Fills and previews the order in a visible window and stops; the user clicks Place order. Use this when the user wants to finalize a trade themselves. Stocks/ETFs by `quantity`; mutual funds (`isMutualFund`: 5 letters ending in X) by dollar `amount` |
-| `fidelity_transfer` | Submits immediately |
+| `fidelity_transfer` | `dry_run` defaults to true: stops on the review step, returns `review` text, never clicks Submit |
+| `fidelity_rebalance_plan` | Read-only. Target weights (percent of account value) → stock `orders` (sells first) and `fundOrders`. Every non-cash holding must be listed (0 to sell), so a partial list never liquidates the rest. Buys round down, sells round up (capped at whole shares held) |
 | `fidelity_screenshot` / `fidelity_page_content` | Debugging selectors; optional `url` opens it first |
 
 Tool calls run one at a time (they share one browser page).
@@ -41,7 +42,8 @@ Tool calls run one at a time (they share one browser page).
 | `src/index.ts` | Tool definitions through one `tool()` adapter (JSON output, `isError`, serialization) |
 | `src/accounts.ts` | Account list, exact account-number matching, transfers |
 | `src/positions.ts` | Positions CSV download and `parsePositionsCsv()` |
-| `src/trading.ts` | Quotes, order type policy (`resolveOrderType`), order ticket |
+| `src/trading.ts` | Quotes, order type policy (`resolveOrderType`), stock/fund routing (`routeOrder`), order tickets |
+| `src/rebalance.ts` | Rebalance planning: pure `checkTargets()` / `planRebalance()`, plus the positions/quotes fetch |
 | `src/scripts/login.ts` | `npm run login`, same code path as `fidelity_login` |
 
 Flows get a page only through `openPage(url)`. It throws `SessionExpiredError` on a sign-in redirect, saves the session after confirming the page is logged in, and closes promo dialogs (e.g. "add a beneficiary") with their X. Wait for elements with `appears(locator, ms)`: Playwright's `isVisible({ timeout })` ignores the timeout.
@@ -56,13 +58,13 @@ Flows get a page only through `openPage(url)`. It throws `SessionExpiredError` o
 
 ## Site map (verified 2026-10-23)
 
-- Positions: `portfolio/positions` → "Available Actions" → `#kebabmenuitem-download`. CSV headers are lower-case after the first word (`Account number`, `Last price`); parsing is case-insensitive.
-- Transfers: `transfer/?quicktransfer=cash-shares`. Native selects labelled From / To, then `#one-time`, `#transfer-amount`, Continue, Submit. The Continue → Submit → "Request submitted" steps were not exercised (no live transfers).
-- Mutual fund ticket: `trade-mutualfund?ORDER_TYPE=M&CURRENT_PAGE=TradeMF&DEST_TRADE=Y`. `#mf-dropdownlist-button` (Account / Action), `#mf-ticket-dest-symbol-Symbol`, `#mf-shared-quantity` (dollars). Fidelity accepts amounts under $1 (a $0.46 FSKAX buy previewed fine).
-- Trade ticket: `trade-equity/index/orderEntry`. Preview errors (e.g. insufficient funds) come back in a dialog. The limit-order path (order type → Limit, "Limit price") was not exercised live.
+- Positions: `portfolio/positions` → "Available Actions" → `#kebabmenuitem-download`. CSV headers are lower-case after the first word (`Account number`, `Last price`); parsing is case-insensitive. The cost basis / gain columns (`Cost basis total`, `Average cost basis`, `Total gain/loss dollar`, `Total gain/loss percent`) were confirmed live on 2026-10-23; a renamed column leaves the field absent.
+- Transfers: `transfer/?quicktransfer=cash-shares`. Native selects labelled From / To, then `#one-time`, `#transfer-amount`, Continue, Submit. The Continue → Submit → "Request submitted" steps were not exercised (no live transfers). The review step's layout is unmapped, so a dry run returns the `main` content as text; once it has been seen, add a fail-closed check of from/to/amount before Submit.
+- Mutual fund ticket: `trade-mutualfund?ORDER_TYPE=M&CURRENT_PAGE=TradeMF&DEST_TRADE=Y`. `#mf-dropdownlist-button` (Account / Action), `#mf-ticket-dest-symbol-Symbol`, `#mf-shared-quantity` (dollars). Fidelity accepts amounts under $1 (a $0.46 FSKAX buy previewed fine). A $1 FSKAX sell dry run through `fidelity_place_order` previewed and passed `previewMismatch` (2026-10-23). Placing (`fidelity_place_order` with `dry_run: false`) waits for "Order received" as on the stock ticket, which was not exercised live: a "may not have been confirmed" result means check Fidelity's orders page, never retry blindly.
+- Trade ticket: `trade-equity/index/orderEntry`. Preview errors (e.g. insufficient funds) come back in a dialog. The limit-order path (order type → Limit, "Limit price") previewed live in extended hours (auto limit one tick past last); placing a limit order was not exercised.
 
 ## Changing the code
 
-- `npm run build` must pass, and the server must answer `tools/list` over stdio. There is no test suite; `parsePositionsCsv`, `parseAccountText`, `readPreview`, `previewMismatch` and `resolveOrderType` are pure and the place to start one.
+- `npm run build` must pass, and the server must answer `tools/list` over stdio. There is no test suite; `parsePositionsCsv`, `parseAccountText`, `readPreview`, `previewMismatch`, `resolveOrderType`, `routeOrder`, `checkTargets` and `planRebalance` are pure and the place to start one.
 - When Fidelity ships UI changes, selectors break. Look before guessing: `fidelity_page_content` / `fidelity_screenshot` with the page URL, or a scratch script importing `dist/session.js` (`openPage`, `closeSession`). Prefer ids and `exact: true` role/label matches.
-- Live testing is read-only: accounts, positions, quotes, and dry-run order previews. Orders with `dry_run: false` and transfers are never part of testing.
+- Live testing is read-only: accounts, positions, quotes, and dry-run order previews. Orders and transfers with `dry_run: false` are never part of testing. A transfer dry run still fills the form and clicks Continue, so run one only when the user asks.

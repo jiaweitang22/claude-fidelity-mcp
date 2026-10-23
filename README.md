@@ -26,9 +26,9 @@ The session is saved to `~/.fidelity-mcp/fidelity_session_default.json` and reus
 
 ## Tools
 
-`fidelity_status`, `fidelity_login`, `fidelity_logout`, `fidelity_get_accounts`, `fidelity_get_positions`, `fidelity_get_quote`, `fidelity_place_order`, `fidelity_stage_order`, `fidelity_batch_orders`, `fidelity_transfer`, `fidelity_screenshot`, `fidelity_page_content`.
+`fidelity_status`, `fidelity_login`, `fidelity_logout`, `fidelity_get_accounts`, `fidelity_get_positions`, `fidelity_get_quote`, `fidelity_place_order`, `fidelity_stage_order`, `fidelity_batch_orders`, `fidelity_rebalance_plan`, `fidelity_transfer`, `fidelity_screenshot`, `fidelity_page_content`.
 
-Orders default to `dry_run: true` (preview only). `fidelity_stage_order` fills and previews an order in a visible window and leaves the final Place order click to you. Transfers submit immediately.
+Orders and transfers default to `dry_run: true` (preview or review step only). Stocks/ETFs trade by share quantity, mutual funds by dollar amount. `fidelity_stage_order` fills and previews an order in a visible window and leaves the final Place order click to you. `fidelity_rebalance_plan` turns target weights into a list of orders without placing any. Positions include cost basis and total gain/loss when Fidelity shows them.
 
 ## Environment variables
 

@@ -55,12 +55,14 @@ export async function getAccountList(): Promise<AccountListItem[]> {
 
 // One-time cash transfer between two Fidelity accounts. The form steps are
 // From → To → amount → Continue (review) → Submit. Fidelity validates the
-// amount against the available balance on the review step.
+// amount against the available balance on the review step. A dry run stops
+// on the review step and returns its text; it never clicks Submit.
 export async function transfer(
   fromAccount: string,
   toAccount: string,
-  amount: number
-): Promise<{ success: boolean; message: string }> {
+  amount: number,
+  dryRun: boolean
+): Promise<{ success: boolean; message: string; review?: string }> {
   const page = await openPage(TRANSFERS_URL);
   if (!(await selectAccount(page, page.getByLabel("From"), fromAccount))) {
     return { success: false, message: `Source account ${fromAccount} not found.` };
@@ -82,6 +84,13 @@ export async function transfer(
       message: `Transfer did not reach the review step (${alert?.trim() || "no Submit button"}). Check Fidelity activity before retrying.`,
     };
   }
+  if (dryRun) {
+    return {
+      success: true,
+      message: `Dry run: reached the review step, not submitted. $${amount.toFixed(2)} from ${fromAccount} to ${toAccount}.`,
+      review: await reviewText(page),
+    };
+  }
   await submit.click();
   await waitForLoading(page);
   const confirmed = await page
@@ -91,4 +100,15 @@ export async function transfer(
   return confirmed
     ? { success: true, message: `Transferred $${amount.toFixed(2)} from ${fromAccount} to ${toAccount}.` }
     : { success: false, message: "Transfer may not have completed. Check Fidelity directly before retrying." };
+}
+
+// The review step's layout has not been mapped yet, so this returns the main
+// content as text for the user to check against the request.
+async function reviewText(page: Page): Promise<string> {
+  const text = await page
+    .locator("main")
+    .first()
+    .innerText({ timeout: 2000 })
+    .catch(() => page.locator("body").innerText());
+  return text.replace(/\s+/g, " ").trim().slice(0, 2000);
 }

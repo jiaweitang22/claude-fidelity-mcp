@@ -5,6 +5,12 @@ export interface Stock {
   lastPrice: number;
   lastPriceChange: number;
   currentValue: number;
+  isCash: boolean;
+  // Absent when Fidelity shows no figure (cash, "--", "n/a")
+  costBasis?: number;
+  averageCost?: number;
+  totalGainLoss?: number;
+  totalGainLossPercent?: number;
 }
 
 export interface Account {

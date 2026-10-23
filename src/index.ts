@@ -4,8 +4,17 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z, type ZodRawShape } from "zod";
 import { getAccountList, transfer } from "./accounts.js";
 import { getPositions } from "./positions.js";
+import { rebalancePlan } from "./rebalance.js";
 import { closeSession, currentPage, login, openPage, status } from "./session.js";
-import { getQuote, isMutualFund, placeBatchOrders, placeOrder, stageFundOrder, stageOrder } from "./trading.js";
+import {
+  getQuote,
+  placeBatchOrders,
+  placeFundOrder,
+  placeOrder,
+  routeOrder,
+  stageFundOrder,
+  stageOrder,
+} from "./trading.js";
 
 const server = new McpServer({ name: "fidelity", version: "2.0.0" });
 
@@ -90,7 +99,7 @@ tool(
 
 tool(
   "fidelity_get_positions",
-  "Get holdings for every account from Fidelity's positions CSV: ticker, quantity, price, value, and cash balance (`balance`).",
+  "Get holdings for every account from Fidelity's positions CSV: ticker, quantity, price, value, cost basis and total gain/loss (when Fidelity shows them), and cash balance (`balance`).",
   {},
   async () => getPositions()
 );
@@ -102,62 +111,57 @@ tool(
   async ({ symbol }) => getQuote(symbol)
 );
 
+// Order fields shared by place and stage. Stocks/ETFs take `quantity`; mutual
+// funds (5-letter tickers ending in X, e.g. FSKAX) take `amount` (see routeOrder).
+const orderFields = {
+  account_number: z.string().describe("Exact Fidelity account number"),
+  symbol: z.string(),
+  action: z.enum(["buy", "sell"]),
+  quantity: z.number().int().positive().optional().describe("Shares, for stocks/ETFs"),
+  amount: z.number().positive().optional().describe("Dollars, for mutual funds"),
+  order_type: z.enum(["market", "limit"]).optional().describe("Stocks/ETFs only. Default market"),
+  limit_price: z.number().positive().optional().describe("Stocks/ETFs only"),
+};
+
+function routeOrderArgs(a: z.objectOutputType<typeof orderFields, z.ZodTypeAny>) {
+  return routeOrder({
+    accountNumber: a.account_number,
+    symbol: a.symbol,
+    action: a.action,
+    quantity: a.quantity,
+    amount: a.amount,
+    orderType: a.order_type,
+    limitPrice: a.limit_price,
+  });
+}
+
 tool(
   "fidelity_place_order",
-  "Buy or sell a stock/ETF. Dry run by default (preview only). Penny stocks (< $1) and extended hours always use limit orders; without limit_price the limit is one tick past the last price. The result shows the exact order (including limit price) for the user to confirm.",
-  {
-    account_number: z.string().describe("Exact Fidelity account number"),
-    symbol: z.string(),
-    action: z.enum(["buy", "sell"]),
-    quantity: z.number().int().positive(),
-    order_type: z.enum(["market", "limit"]).optional().describe("Default market"),
-    limit_price: z.number().positive().optional(),
-    dry_run: dryRun,
-  },
-  async (a) =>
-    placeOrder({
-      accountNumber: a.account_number,
-      symbol: a.symbol,
-      action: a.action,
-      quantity: a.quantity,
-      orderType: a.order_type,
-      limitPrice: a.limit_price,
-      dryRun: a.dry_run,
-    })
+  "Buy or sell a stock/ETF by shares, or a mutual fund by dollar amount (fills at the next NAV). Dry run by default (preview only). Penny stocks (< $1) and extended hours always use limit orders; without limit_price the limit is one tick past the last price. The result shows the exact order (including limit price) for the user to confirm.",
+  { ...orderFields, dry_run: dryRun },
+  async (a) => {
+    const routed = routeOrderArgs(a);
+    if (routed.kind === "error") return { success: false, message: routed.message };
+    return routed.kind === "fund"
+      ? placeFundOrder({ ...routed.order, dryRun: a.dry_run })
+      : placeOrder({ ...routed.order, dryRun: a.dry_run });
+  }
 );
 
 tool(
   "fidelity_stage_order",
   "Set up a buy/sell for the USER to place: opens a visible Fidelity window, fills the trade ticket, clicks Preview, verifies it, and leaves it on the preview screen. The user clicks Place order (or Cancel) there; this tool never places. Stocks/ETFs take `quantity` (whole shares); mutual funds (5-letter tickers ending in X, e.g. FSKAX) take `amount` in dollars and fill at the next NAV. Tell the user the window is open.",
-  {
-    account_number: z.string().describe("Exact Fidelity account number"),
-    symbol: z.string(),
-    action: z.enum(["buy", "sell"]),
-    quantity: z.number().int().positive().optional().describe("Shares, for stocks/ETFs"),
-    amount: z.number().positive().optional().describe("Dollars, for mutual funds"),
-    order_type: z.enum(["market", "limit"]).optional().describe("Stocks/ETFs only. Default market"),
-    limit_price: z.number().positive().optional(),
-  },
+  orderFields,
   async (a) => {
-    if (isMutualFund(a.symbol)) {
-      if (a.amount === undefined) return { success: false, message: `${a.symbol} is a mutual fund: pass amount (dollars), not quantity.` };
-      return stageFundOrder({ accountNumber: a.account_number, symbol: a.symbol, action: a.action, amount: a.amount });
-    }
-    if (a.quantity === undefined) return { success: false, message: `${a.symbol} trades in shares: pass quantity.` };
-    return stageOrder({
-      accountNumber: a.account_number,
-      symbol: a.symbol,
-      action: a.action,
-      quantity: a.quantity,
-      orderType: a.order_type,
-      limitPrice: a.limit_price,
-    });
+    const routed = routeOrderArgs(a);
+    if (routed.kind === "error") return { success: false, message: routed.message };
+    return routed.kind === "fund" ? stageFundOrder(routed.order) : stageOrder(routed.order);
   }
 );
 
 tool(
   "fidelity_batch_orders",
-  "Run several market/auto-limit orders one after another in one account. Dry run by default.",
+  "Run several stock/ETF market/auto-limit orders one after another in one account. Dry run by default. Mutual funds are rejected: use fidelity_place_order with an amount. Orders don't wait for each other to fill.",
   {
     account_number: z.string(),
     orders: z.array(
@@ -173,14 +177,32 @@ tool(
 );
 
 tool(
+  "fidelity_rebalance_plan",
+  "Plan the trades that move one account to target weights (percent of total account value; whatever the weights don't cover stays cash). Plans only, never trades. Every non-cash holding must be listed (weight 0 to sell it). Returns stock `orders` (sells first) for fidelity_batch_orders and mutual fund `fundOrders` for fidelity_place_order; run those as dry runs and show the user before placing anything.",
+  {
+    account_number: z.string().describe("Exact Fidelity account number"),
+    targets: z
+      .array(z.object({ symbol: z.string(), weight: z.number().min(0).max(100).describe("Percent of account value") }))
+      .min(1),
+    min_trade: z.number().min(0).optional().describe("Skip trades smaller than this many dollars. Default 1"),
+  },
+  async ({ account_number, targets, min_trade }) => rebalancePlan(account_number, targets, min_trade)
+);
+
+tool(
   "fidelity_transfer",
-  "Move cash between two of the user's Fidelity accounts. Has no dry run: it submits immediately, so only call after the user confirmed from, to and amount.",
+  "Move cash between two of the user's Fidelity accounts. Dry run by default: fills the form and stops on Fidelity's review step, returning its text in `review`. Show the user that review; set dry_run false only after they confirmed from, to and amount.",
   {
     from_account: z.string(),
     to_account: z.string(),
     amount: z.number().positive().describe("Dollars"),
+    dry_run: z
+      .boolean()
+      .optional()
+      .default(true)
+      .describe("true (default): stop on the review step, never submit. false: submit the transfer. Only set false after the user confirmed from, to and amount."),
   },
-  async ({ from_account, to_account, amount }) => transfer(from_account, to_account, amount)
+  async ({ from_account, to_account, amount, dry_run }) => transfer(from_account, to_account, amount, dry_run)
 );
 
 tool(
